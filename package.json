@@ -1,0 +1,17 @@
+{
+  "name": "smile-labs-ai-studio",
+  "version": "0.7.5",
+  "private": true,
+  "description": "Smile Labs Digital privacy experience and linked legal draft pages",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node test-prompts.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "sharp": "^0.34.4"
+  }
+}
