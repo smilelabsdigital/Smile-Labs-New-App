@@ -9,7 +9,8 @@ const TYPES={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8'
 const sharp=require('sharp');
 const styles=Object.freeze({
  whitening:'Whiten existing teeth only.',
- missing:'Correct the smile by adding the missing teeth. Keep existing teeth unchanged.'
+ missing:'Correct the smile by adding the missing teeth. Keep existing teeth unchanged.',
+ makeover:'Create a realistic, natural-looking cosmetic smile makeover. Improve the teeth alignment, shape, proportions, symmetry and colour to create a beautiful, healthy, balanced smile. Correct crooked, uneven, discoloured or poorly shaped teeth and close unwanted gaps where appropriate. Keep the result natural with believable tooth anatomy, subtle enamel texture and a suitable shade of white. Preserve the person’s original face, lips, gums, skin, facial expression, lighting and background. Only modify the teeth. The final result must look like a professional cosmetic dental treatment preview, not an artificial or exaggerated smile.'
 });
 // Each selection sends its own whitening-only instruction. Never add missing teeth during whitening.
 const WHITENING_SHADES=Object.freeze({
@@ -21,30 +22,65 @@ const WHITENING_SHADES=Object.freeze({
 // One prompt-selection function for every image edit. No shared extra instructions.
 function selectEditPrompt(style,shade){
  if(style==='missing')return styles.missing;
+ if(style==='makeover')return styles.makeover;
  if(style==='whitening' && Object.hasOwn(WHITENING_SHADES,shade))return WHITENING_SHADES[shade].instruction;
  throw Error('Invalid treatment or whitening shade.');
 }
 
+// Neon persistence: one durable document for the existing account model. Intended for a
+// single Render web-service instance; use relational tables/transactions before scaling.
+const DATABASE_URL=typeof process==='undefined'?null:process.env.DATABASE_URL;
+let pool=null;
 let db={users:[],events:[]},writeQueue=Promise.resolve();
-async function init(){try{db=JSON.parse(await fs.readFile(DATA,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;await save();}}
-function save(){writeQueue=writeQueue.then(async()=>{await fs.mkdir(path.dirname(DATA),{recursive:true});const tmp=DATA+'.tmp';await fs.writeFile(tmp,JSON.stringify(db,null,2),{mode:0o600});await fs.rename(tmp,DATA);});return writeQueue;}
+async function init(){
+ if(DATABASE_URL){
+  const {Pool}=require('pg');
+  pool=new Pool({connectionString:DATABASE_URL,max:3,connectionTimeoutMillis:15000,idleTimeoutMillis:30000});
+  await pool.query('CREATE TABLE IF NOT EXISTS smile_labs_state (id integer PRIMARY KEY CHECK (id=1), payload jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())');
+  const result=await pool.query('SELECT payload FROM smile_labs_state WHERE id=1');
+  if(result.rows.length){db=result.rows[0].payload;console.log('Loaded accounts and usage from Neon.');}
+  else{
+   // Initial import for local development only; Render's ephemeral old JSON
+   // files generally cannot be recovered after a redeploy.
+   try{db=JSON.parse(await fs.readFile(DATA,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
+   await save();
+   console.log('Initialised durable Neon account storage.');
+  }
+ }else{
+  if(process.env.NODE_ENV==='production')throw Error('DATABASE_URL is required in production to prevent lost registrations.');
+  try{db=JSON.parse(await fs.readFile(DATA,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;await save();}
+  console.warn('Development mode: accounts saved locally only.');
+ }
+ if(!Array.isArray(db.users))db.users=[];
+ if(!Array.isArray(db.events))db.events=[];
+}
+function save(){
+ // Snapshot immediately, so queued saves cannot accidentally skip intermediate state.
+ const snapshot=JSON.stringify(db);
+ writeQueue=writeQueue.catch(e=>{console.error('Previous storage write failed:',e);}).then(async()=>{
+  if(pool){await pool.query('INSERT INTO smile_labs_state (id,payload,updated_at) VALUES (1,$1::jsonb,now()) ON CONFLICT (id) DO UPDATE SET payload=EXCLUDED.payload,updated_at=now()', [snapshot]);}
+  else {await fs.mkdir(path.dirname(DATA),{recursive:true});const tmp=DATA+'.tmp';await fs.writeFile(tmp,snapshot,{mode:0o600});await fs.rename(tmp,DATA);}
+ });
+ return writeQueue;
+}
 function reply(res,status,obj){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(obj));}
 async function readBody(req,limit=20*1024*1024){let a=[],n=0;for await(const ch of req){n+=ch.length;if(n>limit)throw Error('Request too large.');a.push(ch);}return JSON.parse(Buffer.concat(a).toString('utf8'));}
 const clean=(v,max=120)=>typeof v==='string'?v.trim().slice(0,max):'';
 const emailOK=s=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)&&s.length<=254;
-function token(user){const payload=Buffer.from(JSON.stringify({id:user.id,exp:Date.now()+7*86400000})).toString('base64url');return payload+'.'+crypto.createHmac('sha256',SECRET).update(payload).digest('base64url');}
-function current(req){try{const raw=(req.headers.cookie||'').split(';').map(s=>s.trim()).find(s=>s.startsWith('sl_session='))?.slice(11)||'';const [p,s]=raw.split('.');if(!p||!s)return null;const valid=crypto.createHmac('sha256',SECRET).update(p).digest('base64url');if(!crypto.timingSafeEqual(Buffer.from(s),Buffer.from(valid)))return null;const d=JSON.parse(Buffer.from(p,'base64url').toString());return d.exp>Date.now()?db.users.find(u=>u.id===d.id)||null:null;}catch{return null;}}
-function cookie(res,user){res.setHeader('Set-Cookie',`sl_session=${token(user)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${process.env.COOKIE_SECURE==='true'?'; Secure':''}`);}
-// Quotas are computed separately by role. Professional credits reset each calendar month (UTC).
+function token(user){const payload=Buffer.from(JSON.stringify({id:user.id,exp:Date.now()+30*86400000})).toString('base64url');return payload+'.'+crypto.createHmac('sha256',SECRET).update(payload).digest('base64url');}
+function current(req){try{const auth=String(req.headers.authorization||'');const raw=(auth.startsWith('Bearer ')?auth.slice(7):'')||((req.headers.cookie||'').split(';').map(s=>s.trim()).find(s=>s.startsWith('sl_session='))?.slice(11)||'');const [p,s]=raw.split('.');if(!p||!s)return null;const valid=crypto.createHmac('sha256',SECRET).update(p).digest('base64url');if(!crypto.timingSafeEqual(Buffer.from(s),Buffer.from(valid)))return null;const d=JSON.parse(Buffer.from(p,'base64url').toString());return d.exp>Date.now()?db.users.find(u=>u.id===d.id)||null:null;}catch{return null;}}
+function cookie(res,user){res.setHeader('Set-Cookie',`sl_session=${token(user)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${process.env.COOKIE_SECURE==='true'?'; Secure':''}`);}
+// Preview quotas are lifetime, persisted in Neon. Approval adds 20 credits once; not unlimited.
 const currentMonth=()=>new Date().toISOString().slice(0,7);
-const dentistLimit=()=>10; // Fixed 10 per month, independent of old .env settings
+const guestLimit=()=>1; // One guest preview per persistent browser token
+const dentistLimit=u=>u?.approved?30:10; // 10 on verified signup, +20 on manual approval
 // Administrator testing is granted ONLY to verified account email addresses explicitly
 // listed server-side. The dashboard password alone is not a signed-in studio account.
 // No admin privileges can be requested through the registration form or browser.
-const adminTestEmails=()=>new Set((process.env.ADMIN_TEST_EMAILS||process.env.ADMIN_TEST_EMAIL||'').split(',').map(v=>v.trim().toLowerCase()).filter(Boolean));
+const adminTestEmails=()=>new Set([process.env.ADMIN_EMAIL||'',...(process.env.ADMIN_TEST_EMAILS||process.env.ADMIN_TEST_EMAIL||'').split(',')].map(v=>v.trim().toLowerCase()).filter(Boolean));
 const isAdminTester=u=>Boolean(u?.verified && adminTestEmails().has(String(u.email||'').toLowerCase()));
-function usedThisPeriod(u){return u.role==='dentist'&&u.month!==currentMonth()?0:Math.max(0,Number(u.used)||0);}
-function publicUser(u){return u?{id:u.id,name:u.name,email:u.email,role:u.role,verified:u.verified,approved:u.approved,adminTester:isAdminTester(u),used:usedThisPeriod(u),limit:isAdminTester(u)?null:(u.role==='dentist'?dentistLimit():1),clinic:u.clinic||'',gdc:u.gdc||'',created:u.created}:null;}
+function usedThisPeriod(u){return Math.max(0,Number(u.used)||0);}
+function publicUser(u){return u?{id:u.id,name:u.name,email:u.email,role:u.role,verified:u.verified,approved:u.approved,adminTester:isAdminTester(u),used:usedThisPeriod(u),limit:isAdminTester(u)?null:(u.role==='dentist'?dentistLimit(u):(u.guestTokenHash?guestLimit():1)),clinic:u.clinic||'',gdc:u.gdc||'',created:u.created,verifiedGdc:!!u.gdcVerified}:null;}
 async function sendEmail(to,subject,html){
  if(!process.env.RESEND_API_KEY||!process.env.RESEND_FROM_EMAIL){
   if(DEV){console.log('[EMAIL NOT CONFIGURED]',subject);return false;}
@@ -284,9 +320,80 @@ async function whitenExistingTeeth(png,shadeKey="natural"){
 }
 
 const pending=new Set();
+// Account deletion: independent email re-verification, not a bearer-only destructive action.
+// PINs are HMAC-hashed with the server secret, expire after 10 minutes, and allow 5 attempts.
+const deletionRate=new Map();
+function deletionKey(email){return crypto.createHmac('sha256',SECRET).update('deletion-rate:'+email).digest('hex');}
+function deletionCodeHash(email,code){return crypto.createHmac('sha256',SECRET).update('delete:'+email+':'+code).digest('hex');}
+function deletionAllowed(email){
+ const key=deletionKey(email),now=Date.now(),history=(deletionRate.get(key)||[]).filter(x=>now-x<3600000);
+ if(history.length>=5)return false;
+ history.push(now);deletionRate.set(key,history);
+ // Bound memory for long-running servers.
+ if(deletionRate.size>3000){for(const [k,v] of deletionRate){if(v.every(x=>now-x>3600000))deletionRate.delete(k);}}
+ return true;
+}
+async function requestAccountDeletion(req,res){
+ let d;try{d=await readBody(req,4096);}catch{return reply(res,400,{error:'Invalid request.'});}
+ const email=clean(d.email,254).toLowerCase();
+ if(!emailOK(email))return reply(res,400,{error:'Enter a valid email address.'});
+ if(!deletionAllowed(email))return reply(res,429,{error:'Too many requests. Try again later.'});
+ const user=db.users.find(x=>x.role==='dentist'&&x.verified&&x.email===email);
+ // Do not reveal whether a registration exists.
+ const message='If this address has a registered account, a confirmation code will be sent.';
+ if(!user)return reply(res,200,{message});
+ const code=String(crypto.randomInt(100000,1000000));
+ try{
+  await sendEmail(user.email,'Smile Labs Digital — confirm account deletion',
+   `<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:24px"><h2>Account deletion request</h2><p>Enter this code in Smile Labs Digital to permanently delete your professional account:</p><p style="font-size:32px;letter-spacing:5px"><strong>${code}</strong></p><p>This code expires in 10 minutes. If you did not request deletion, ignore this message and consider contacting support.</p><p>Smile Labs Digital</p></div>`);
+ }catch(e){console.error('Deletion verification email failed:',e.message);return reply(res,503,{error:'Unable to send confirmation email. Try again later.'});}
+ user.deleteCodeHash=deletionCodeHash(email,code);
+ user.deleteCodeUntil=Date.now()+10*60000;
+ user.deleteCodeAttempts=0;
+ await save();
+ return reply(res,200,{message});
+}
+async function confirmAccountDeletion(req,res){
+ let d;try{d=await readBody(req,4096);}catch{return reply(res,400,{error:'Invalid request.'});}
+ const email=clean(d.email,254).toLowerCase(),code=clean(d.code,8);
+ if(!emailOK(email)||!/^[0-9]{6}$/.test(code))return reply(res,400,{error:'Enter the email and six-digit code.'});
+ const user=db.users.find(x=>x.role==='dentist'&&x.verified&&x.email===email);
+ if(!user||!user.deleteCodeHash||user.deleteCodeUntil<Date.now())return reply(res,400,{error:'Invalid or expired code.'});
+ if((user.deleteCodeAttempts||0)>=5)return reply(res,429,{error:'Too many incorrect codes. Request a new code.'});
+ const supplied=deletionCodeHash(email,code);
+ if(!crypto.timingSafeEqual(Buffer.from(supplied),Buffer.from(user.deleteCodeHash))){
+  user.deleteCodeAttempts=(user.deleteCodeAttempts||0)+1;await save();
+  return reply(res,400,{error:'Invalid or expired code.'});
+ }
+ if(pending.has(user.id))return reply(res,409,{error:'An AI generation is still running. Please try again after it finishes.'});
+ // Removing the account immediately invalidates signed sessions: current() checks db.users.
+ // Also purge all stored activity referencing the account and its profile metadata.
+ db.users=db.users.filter(x=>x.id!==user.id);
+ db.events=db.events.filter(x=>x.userId!==user.id);
+ try{await save();}catch(e){console.error('Account deletion storage failed:',e);return reply(res,503,{error:'Account deletion could not be completed. Please contact support.'});}
+ res.setHeader('Set-Cookie','sl_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
+ return reply(res,200,{deleted:true,message:'Your Smile Labs Digital account and its stored activity have been deleted.'});
+}
+
 
 async function api(req,res,route){
+ if(route==='/api/account/delete-request'&&req.method==='POST')return requestAccountDeletion(req,res);
+ if(route==='/api/account/delete-confirm'&&req.method==='POST')return confirmAccountDeletion(req,res);
  if(route==='/api/status'&&req.method==='GET')return reply(res,200,{user:publicUser(current(req)),aiConfigured:!!process.env.OPENAI_API_KEY,emailConfigured:!!(process.env.RESEND_API_KEY&&process.env.RESEND_FROM_EMAIL),prototype:true});
+ if(route==='/api/guest'&&req.method==='POST'){
+  // Demonstration-only 50 uses per signed browser cookie, not strong anti-abuse.
+  const cookieVal=(req.headers.cookie||'').split(';').map(v=>v.trim()).find(v=>v.startsWith('sl_guest_token='))?.slice(15)||'';
+  let guest=db.users.find(u=>u.role==='public'&&u.guestTokenHash&&crypto.createHash('sha256').update(cookieVal).digest('hex')===u.guestTokenHash);
+  // If a guest token no longer exists in storage, start a fresh guest session.
+  // The original guest's previous credits cannot be recovered without the record.
+  if(!guest){
+   const raw=crypto.randomBytes(32).toString('base64url');
+   guest={id:crypto.randomUUID(),role:'public',name:'Guest',email:'',phone:'',address:'',clinic:'',gdc:'',verified:true,approved:false,used:0,month:currentMonth(),created:new Date().toISOString(),guestTokenHash:crypto.createHash('sha256').update(raw).digest('hex')};
+   db.users.push(guest);await save();
+   res.setHeader('Set-Cookie',[`sl_guest_token=${raw}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000${process.env.COOKIE_SECURE==='true'?'; Secure':''}`,`sl_session=${token(guest)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${process.env.COOKIE_SECURE==='true'?'; Secure':''}`]);
+  }else cookie(res,guest);
+  return reply(res,200,{user:publicUser(guest),mobileToken:req.headers['x-smile-mobile-app']==='1'?token(guest):undefined});
+ }
  if(route==='/api/register'&&req.method==='POST'){
   let d;try{d=await readBody(req,16000);}catch{return reply(res,400,{error:'Invalid registration form.'});}
   const role=d.role==='dentist'?'dentist':d.role==='public'?'public':null,name=clean(d.name),email=clean(d.email,254).toLowerCase(),phone=clean(d.phone,40),address=clean(d.address,240),clinic=clean(d.clinic),gdc=clean(d.gdc,30);
@@ -304,7 +411,7 @@ async function api(req,res,route){
  if(route==='/api/verify'&&req.method==='POST'){
   let d;try{d=await readBody(req,4096);}catch{return reply(res,400,{error:'Invalid request.'});}const u=db.users.find(x=>x.email===clean(d.email,254).toLowerCase());const hash=crypto.createHash('sha256').update(clean(d.code,12)).digest('hex');
   if(!u||!u.codeHash||u.codeUntil<Date.now()||hash!==u.codeHash)return reply(res,400,{error:'Invalid or expired code.'});
-  u.verified=true;delete u.codeHash;delete u.codeUntil;await save();cookie(res,u);return reply(res,200,{user:publicUser(u)});
+  u.verified=true;delete u.codeHash;delete u.codeUntil;await save();cookie(res,u);return reply(res,200,{user:publicUser(u),mobileToken:req.headers['x-smile-mobile-app']==='1'?token(u):undefined});
  }
  if(route==='/api/login'&&req.method==='POST'){
   // Email code sign-in, no password storage.
@@ -320,9 +427,9 @@ async function api(req,res,route){
  if(route==='/api/logout'&&req.method==='POST'){res.setHeader('Set-Cookie','sl_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');return reply(res,200,{ok:true});}
  const u=current(req);
  if(route==='/api/generate'&&req.method==='POST'){
-  if(!u||!u.verified)return reply(res,401,{error:'Please register and verify your email first.'});if(u.role==='dentist'&&!u.approved&&!isAdminTester(u))return reply(res,403,{error:'Your dental professional account is awaiting Smile Labs approval.'});
-  if(!isAdminTester(u)&&u.role==='public'&&usedThisPeriod(u)>=1)return reply(res,403,{error:'Your one complimentary preview has already been used.'});
-  if(!isAdminTester(u)&&u.role==='dentist'&&usedThisPeriod(u)>=dentistLimit())return reply(res,403,{error:'Your monthly allowance has been used.'});
+  if(!u||!u.verified)return reply(res,401,{error:'Please register and verify your email first.'});
+  if(!isAdminTester(u)&&u.role==='public'&&usedThisPeriod(u)>=(u.guestTokenHash?guestLimit():1))return reply(res,403,{error:'Your free preview allowance has been used.'});
+  if(!isAdminTester(u)&&u.role==='dentist'&&usedThisPeriod(u)>=dentistLimit(u))return reply(res,403,{error:'Your professional preview allowance has been used.'});
   if(pending.has(u.id))return reply(res,429,{error:'A generation is already running for this account.'});
   let d;try{d=await readBody(req);}catch{return reply(res,400,{error:'Invalid photograph upload.'});}
   if(d.consent!==true||d.photoConsentVersion!=='v1-cosmetic-preview'||!Object.hasOwn(styles,d.style)||(d.style==='whitening'&&!Object.hasOwn(WHITENING_SHADES,d.shade)))return reply(res,400,{error:'Please select a style and confirm photo permission.'});
@@ -367,7 +474,6 @@ async function api(req,res,route){
        const avg=delta/smallOriginal.length;
        if(avg<1.35)return reply(res,422,{error:'The AI returned an almost unchanged photograph. Please retry with a clearer photo. No app preview credit deducted (the API may still charge for the request).'});
      } catch(e) { console.warn('AI result validation:',e);return reply(res,422,{error:'The image provider returned an invalid result. No app preview credit deducted.'}); }
-     if(u.role==='dentist'&&u.month!==currentMonth()){u.month=currentMonth();u.used=0;}
      if(!isAdminTester(u))u.used++;await save();await notify(u,'generation',d.style);
      return reply(res,200,{image:'data:image/png;base64,'+final.toString('base64'),user:publicUser(u),selectedShade:d.style==='whitening'?d.shade:null,processing:'openai-image-edit'});
    }catch(e){console.error('Smile edit error:',e);return reply(res,502,{error:e.name==='AbortError'?'Image processing timed out. Please retry later.':e.message?.includes('fetch failed')?'Could not connect to the image service. Check your internet connection and restart the app; see VS Code terminal for details.':'Image processing error. Check the VS Code terminal for details.'});}
@@ -378,10 +484,10 @@ async function api(req,res,route){
   if(!process.env.ADMIN_PASSWORD)return reply(res,503,{error:'Configure ADMIN_PASSWORD to enable admin dashboard.'});
   let d;try{d=await readBody(req,4096);}catch{return reply(res,400,{error:'Invalid request.'});}
   const a=Buffer.from(clean(d.password,300)),b=Buffer.from(process.env.ADMIN_PASSWORD);if(a.length!==b.length||!crypto.timingSafeEqual(a,b))return reply(res,401,{error:'Incorrect admin password.'});
-  if(d.action==='approve'||d.action==='reject'){const target=db.users.find(x=>x.id===d.id&&x.role==='dentist');if(!target)return reply(res,404,{error:'Application not found.'});target.approved=d.action==='approve';await save();}
-  return reply(res,200,{users:db.users.map(x=>({...publicUser(x),phone:x.phone,address:x.address})),events:db.events.slice(-100).reverse()});
+  if(d.action==='approve'||d.action==='reject'){const target=db.users.find(x=>x.id===d.id&&x.role==='dentist');if(!target)return reply(res,404,{error:'Professional account not found.'});target.approved=d.action==='approve';target.gdcVerified=d.action==='approve';target.reviewedAt=new Date().toISOString();await save();}
+  return reply(res,200,{users:db.users.map(x=>({...publicUser(x),phone:x.phone,address:x.address})),events:db.events.slice(-200).reverse().map(e=>({...e,userName:db.users.find(u=>u.id===e.userId)?.name||'Unknown',userEmail:db.users.find(u=>u.id===e.userId)?.email||'Guest'}))});
  }
  return reply(res,404,{error:'Not found.'});
 }
 const server=http.createServer(async(req,res)=>{try{const route=new URL(req.url,'http://localhost').pathname;if(route.startsWith('/api/'))return await api(req,res,route);if(req.method!=='GET')return reply(res,405,{error:'Method not allowed'});const file=path.resolve(PUBLIC,'.'+decodeURIComponent(route==='/'?'/index.html':route));if(!file.startsWith(PUBLIC+path.sep))return reply(res,403,{error:'Forbidden'});try{const data=await fs.readFile(file);res.writeHead(200,{'Content-Type':TYPES[path.extname(file)]||'application/octet-stream','X-Content-Type-Options':'nosniff','Cache-Control':'no-store'});res.end(data);}catch{res.writeHead(404);res.end('Not found');}}catch(e){console.error(e);reply(res,500,{error:'Server error.'});}});
-init().then(()=>server.listen(PORT,()=>console.log(`Smile Labs Digital v0.7.5: http://localhost:${PORT}`))).catch(e=>{console.error(e);process.exit(1)});
+init().then(()=>server.listen(PORT,()=>console.log(`Smile Labs Digital v1.0.3: http://localhost:${PORT}`))).catch(e=>{console.error(e);process.exit(1)});
